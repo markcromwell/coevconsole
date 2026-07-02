@@ -1,0 +1,25 @@
+# Blue-green overlay — app-green runs the NEW build on a SECONDARY port, sharing the tier's Postgres, so
+# it is health-gated (and applies the expand-safe migration) BEFORE the canonical `app` (blue) adopts it.
+# Used by DEPLOY_TARGET=bluegreen-compose (sov deploy). Set COEVCONSOLE_GREEN_PORT in deploy/<tier>.env.
+services:
+  app-green:
+    # Green deploys the SAME pre-built COEVCONSOLE_IMAGE blue will adopt (no rebuild divergence — green
+    # validates the exact artifact). `build:` is the local-dev fallback when COEVCONSOLE_IMAGE is unset.
+    image: ${COEVCONSOLE_IMAGE:-coevconsole:latest}
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "${COEVCONSOLE_GREEN_PORT:-8900}:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:${COEVCONSOLE_DB_PASSWORD:-app}@db:5432/${COEVCONSOLE_DB_NAME:-app}
+      APP_API_KEY: ${COEVCONSOLE_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: "no"

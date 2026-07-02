@@ -1,0 +1,44 @@
+# Standard SOV Program — +db module compose (app + Postgres), TIER-PARAMETERIZED for `sov deploy`.
+# Each tier deploys as its OWN compose project (sov deploy COEVCONSOLE <tier>) reading deploy/<tier>.env,
+# so qual/uat/prod get isolated networks, ports, and Postgres volumes. The app still boots standalone on
+# SQLite (DATABASE_URL=sqlite:///./app.db) for local dev / the boot-smoke.
+services:
+  app:
+    # BUILD-ONCE, PROMOTE-THE-ARTIFACT: `sov deploy` builds coevconsole:<sha> once and exports COEVCONSOLE_IMAGE,
+    # so every tier deploys that SAME pre-built image (no per-tier rebuild). `build:` is the dev/CI fallback
+    # used only when COEVCONSOLE_IMAGE is unset (e.g. a bare `docker compose up` for local dev).
+    image: ${COEVCONSOLE_IMAGE:-coevconsole:latest}
+    build: .
+    # Run migrations on the shared Postgres BEFORE serving (the Dockerfile CMD is uvicorn-only, and
+    # init_sqlite_schema deliberately skips Postgres) — else the stack boots but the tables never exist.
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "${COEVCONSOLE_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:${COEVCONSOLE_DB_PASSWORD:-app}@db:5432/${COEVCONSOLE_DB_NAME:-app}
+      APP_API_KEY: ${COEVCONSOLE_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${COEVCONSOLE_DB_PASSWORD:-app}
+      POSTGRES_DB: ${COEVCONSOLE_DB_NAME:-app}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  pgdata:

@@ -353,6 +353,143 @@ def test_submission_page_renders_live_poll_not_stale_last_seen(monkeypatch, tmp_
     ]
 
 
+def test_index_live_polls_non_terminal_history_and_persists_refresh(monkeypatch, tmp_path):
+    app, db, models, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+
+    def job_result(call):
+        job_id, _ = call
+        return {"id": job_id, "status": "complete", "score": 0.64}
+
+    fake = FakeCoEv2Client(job_result=job_result)
+    _override_client(app, coev2_client, fake)
+    base_time = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    with db.SessionLocal() as session:
+        session.add(
+            models.Submission(
+                console_id="console-old",
+                coev2_job_id="job-old",
+                kind="grade",
+                submitted_at=base_time,
+                last_seen_status="running",
+                last_seen_score=None,
+                idempotency_key="idem-old",
+            )
+        )
+        for index in range(19):
+            session.add(
+                models.Submission(
+                    console_id=f"console-terminal-{index}",
+                    coev2_job_id=f"job-terminal-{index}",
+                    kind="grade",
+                    submitted_at=base_time + timedelta(minutes=index + 1),
+                    last_seen_status="complete",
+                    last_seen_score=1,
+                    idempotency_key=f"idem-terminal-{index}",
+                )
+            )
+        session.add(
+            models.Submission(
+                console_id="console-live-list",
+                coev2_job_id="job-live-list",
+                kind="grade",
+                submitted_at=base_time + timedelta(minutes=20),
+                last_seen_status="running",
+                last_seen_score=None,
+                idempotency_key="idem-live-list",
+            )
+        )
+        session.add(
+            models.Submission(
+                console_id="console-terminal-recent",
+                coev2_job_id="job-terminal-recent",
+                kind="grade",
+                submitted_at=base_time + timedelta(minutes=21),
+                last_seen_status="completed",
+                last_seen_score=0.9,
+                idempotency_key="idem-terminal-recent",
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    page = client.get("/")
+
+    assert page.status_code == 200
+    assert re.search(r"complete\s*/\s*0\.64", page.text)
+    assert not re.search(r"running\s*/\s*unknown", page.text)
+    assert fake.poll_calls == [("job-live-list", "grade")]
+    assert ("job-terminal-recent", "grade") not in fake.poll_calls
+    assert ("job-old", "grade") not in fake.poll_calls
+
+    with db.SessionLocal() as session:
+        refreshed = session.get(models.Submission, "console-live-list")
+        terminal = session.get(models.Submission, "console-terminal-recent")
+    assert refreshed.last_seen_status == "complete"
+    assert refreshed.last_seen_score == 0.64
+    assert terminal.last_seen_status == "completed"
+    assert terminal.last_seen_score == 0.9
+
+
+def test_index_failed_live_poll_marks_only_that_history_row_stale(monkeypatch, tmp_path):
+    app, db, models, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+    from app.coev2_client import CoEv2ClientError
+
+    def job_result(call):
+        job_id, _ = call
+        if job_id == "job-fail-list":
+            raise CoEv2ClientError("CoEv2 request timed out", "corr-stale-list", 504)
+        return {"id": job_id, "status": "complete", "score": 0.73}
+
+    fake = FakeCoEv2Client(job_result=job_result)
+    _override_client(app, coev2_client, fake)
+    base_time = datetime(2026, 1, 6, tzinfo=timezone.utc)
+    with db.SessionLocal() as session:
+        session.add(
+            models.Submission(
+                console_id="console-fail-list",
+                coev2_job_id="job-fail-list",
+                kind="grade",
+                submitted_at=base_time,
+                last_seen_status="running",
+                last_seen_score=None,
+                idempotency_key="idem-fail-list",
+            )
+        )
+        session.add(
+            models.Submission(
+                console_id="console-ok-list",
+                coev2_job_id="job-ok-list",
+                kind="grade",
+                submitted_at=base_time + timedelta(minutes=1),
+                last_seen_status="running",
+                last_seen_score=None,
+                idempotency_key="idem-ok-list",
+            )
+        )
+        session.add(
+            models.Submission(
+                console_id="console-terminal-list",
+                coev2_job_id="job-terminal-list",
+                kind="grade",
+                submitted_at=base_time + timedelta(minutes=2),
+                last_seen_status="failed",
+                last_seen_score=None,
+                idempotency_key="idem-terminal-list",
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    page = client.get("/")
+
+    assert page.status_code == 200
+    assert re.search(r"running\s*/\s*unknown", page.text)
+    assert "stale (Correlation ID: corr-stale-list)" in page.text
+    assert re.search(r"complete\s*/\s*0\.73", page.text)
+    assert fake.poll_calls == [("job-ok-list", "grade"), ("job-fail-list", "grade")]
+    assert ("job-terminal-list", "grade") not in fake.poll_calls
+
+
 def test_unknown_kind_poll_fails_cleanly_with_correlation_id(monkeypatch, tmp_path):
     app, db, models, _, _, _ = _load_app(monkeypatch, tmp_path)
     with db.SessionLocal() as session:

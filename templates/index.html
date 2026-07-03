@@ -85,6 +85,9 @@
               <td>
                 {{ item.last_seen_status or "unknown" }} /
                 {{ item.last_seen_score if item.last_seen_score is not none else "unknown" }}
+                {% if item.stale %}
+                  <span class="muted">stale (Correlation ID: {{ item.correlation_id }})</span>
+                {% endif %}
               </td>
             </tr>
           {% endfor %}

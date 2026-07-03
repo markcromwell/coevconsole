@@ -82,10 +82,12 @@ def loading(request: Request, session: Session = Depends(get_session)):
 @router.post("/grade/prepare", response_class=HTMLResponse)
 def prepare_grade_page(
     request: Request,
-    prompt: str = Form(""),
+    program_id: int = Form(...),
+    level: str = Form(...),
+    content: str = Form(""),
     session: Session = Depends(get_session),
 ):
-    draft = prepare_grade({"prompt": prompt})
+    draft = prepare_grade({"program_id": program_id, "level": level, "content": content})
     return _templates.TemplateResponse(
         request,
         "index.html",
@@ -95,7 +97,9 @@ def prepare_grade_page(
             "history": _history(session),
             "state": "confirm",
             "draft": draft,
-            "prompt": prompt,
+            "program_id": program_id,
+            "level": level,
+            "content": content,
         },
     )
 

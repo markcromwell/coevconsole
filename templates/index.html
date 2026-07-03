@@ -18,8 +18,17 @@
 <body>
   <h1>{{ app_name }}</h1>
   <form method="post" action="/grade/prepare">
-    <label for="prompt">Grade input</label>
-    <textarea id="prompt" name="prompt">{{ prompt or "" }}</textarea>
+    <label for="program_id">Program ID</label>
+    <input id="program_id" name="program_id" type="number" min="1" value="{{ program_id or "" }}" required>
+    <label for="level">Level</label>
+    <select id="level" name="level" required>
+      <option value="vision" {% if level == "vision" %}selected{% endif %}>vision</option>
+      <option value="epic" {% if level == "epic" %}selected{% endif %}>epic</option>
+      <option value="story" {% if level == "story" %}selected{% endif %}>story</option>
+      <option value="spec" {% if level == "spec" %}selected{% endif %}>spec</option>
+    </select>
+    <label for="content">Grade input</label>
+    <textarea id="content" name="content">{{ content or "" }}</textarea>
     <button type="submit">Prepare grade</button>
   </form>
 

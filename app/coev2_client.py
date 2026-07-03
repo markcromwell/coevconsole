@@ -11,6 +11,7 @@ from app.config import Settings, settings
 
 LOG = logging.getLogger(__name__)
 REDACTED = "[REDACTED]"
+VALID_JOB_KINDS = frozenset({"grade", "vision"})
 
 
 class CoEv2ClientError(Exception):
@@ -46,8 +47,20 @@ class CoEv2Client:
     def grade(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         return self._request("POST", "/grade", json=payload)
 
-    def get_job(self, job_id: str) -> tuple[dict[str, Any], str]:
-        return self._request("GET", f"/jobs/{job_id}")
+    def get_job(self, job_id: str, kind: str) -> tuple[dict[str, Any], str]:
+        if kind not in VALID_JOB_KINDS:
+            correlation_id = str(uuid4())
+            LOG.warning(
+                "unsupported job kind correlation_id=%s kind=%s",
+                correlation_id,
+                kind,
+            )
+            raise CoEv2ClientError(
+                f"Unsupported job kind: {kind}",
+                correlation_id,
+                400,
+            )
+        return self._request("GET", f"/{kind}/{job_id}")
 
     def _request(self, method: str, path: str, **kwargs: Any) -> tuple[dict[str, Any], str]:
         correlation_id = str(uuid4())

@@ -51,6 +51,7 @@ class FakeCoEv2Client:
         self.error = error
         self.grade_calls = []
         self.poll_calls = []
+        self.get_job_calls = []
 
     def grade(self, payload):
         self.grade_calls.append(payload)
@@ -59,11 +60,13 @@ class FakeCoEv2Client:
         result = self.grade_result(payload) if callable(self.grade_result) else self.grade_result
         return result, "corr-grade"
 
-    def get_job(self, job_id):
-        self.poll_calls.append(job_id)
+    def get_job(self, job_id, kind):
+        path = f"/{kind}/{job_id}"
+        self.poll_calls.append((job_id, kind))
+        self.get_job_calls.append({"job_id": job_id, "kind": kind, "path": path})
         if self.error:
             raise self.error
-        result = self.job_result(job_id) if callable(self.job_result) else self.job_result
+        result = self.job_result((job_id, kind)) if callable(self.job_result) else self.job_result
         return result, "corr-live"
 
 
@@ -268,7 +271,114 @@ def test_history_lists_last_20_and_submission_page_polls_live(monkeypatch, tmp_p
     page = client.get("/submissions/console-24")
     assert "Score: 99" in page.text
     assert "fresh" in page.text
-    assert fake.poll_calls == ["job-24"]
+    assert fake.poll_calls == [("job-24", "grade")]
+    assert fake.get_job_calls == [
+        {"job_id": "job-24", "kind": "grade", "path": "/grade/job-24"}
+    ]
+
+
+def test_bff_submission_polls_kind_scoped_path_and_surfaces_live_score(monkeypatch, tmp_path):
+    app, db, models, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+    fake = FakeCoEv2Client(
+        job_result={
+            "id": "job-live",
+            "status": "complete",
+            "score": 0.84,
+            "actual_cost_usd": 0.12,
+        }
+    )
+    _override_client(app, coev2_client, fake)
+    with db.SessionLocal() as session:
+        session.add(
+            models.Submission(
+                console_id="console-live",
+                coev2_job_id="job-live",
+                kind="grade",
+                submitted_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                last_seen_status="running",
+                last_seen_score=None,
+                idempotency_key="idem-live",
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    response = client.get("/bff/submissions/console-live").json()
+
+    assert fake.get_job_calls == [
+        {"job_id": "job-live", "kind": "grade", "path": "/grade/job-live"}
+    ]
+    assert fake.get_job_calls[0]["path"] != "/jobs/job-live"
+    assert response["live"]["status"] == "complete"
+    assert response["live"]["score"] == 0.84
+    assert response["live"]["actual_cost_usd"] == 0.12
+
+
+def test_submission_page_renders_live_poll_not_stale_last_seen(monkeypatch, tmp_path):
+    app, db, models, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+    fake = FakeCoEv2Client(
+        job_result={
+            "id": "job-stale",
+            "status": "complete",
+            "score": 0.67,
+            "actual_cost_usd": 0.05,
+            "findings": ["polled live"],
+        }
+    )
+    _override_client(app, coev2_client, fake)
+    with db.SessionLocal() as session:
+        session.add(
+            models.Submission(
+                console_id="console-stale",
+                coev2_job_id="job-stale",
+                kind="grade",
+                submitted_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+                last_seen_status="running",
+                last_seen_score=None,
+                idempotency_key="idem-stale",
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    page = client.get("/submissions/console-stale")
+
+    assert "Status: complete" in page.text
+    assert "Score: 0.67" in page.text
+    assert "Cost: 0.05" in page.text
+    assert "polled live" in page.text
+    assert page.text.index("Status: complete") < page.text.index("History")
+    assert fake.get_job_calls == [
+        {"job_id": "job-stale", "kind": "grade", "path": "/grade/job-stale"}
+    ]
+
+
+def test_unknown_kind_poll_fails_cleanly_with_correlation_id(monkeypatch, tmp_path):
+    app, db, models, _, _, _ = _load_app(monkeypatch, tmp_path)
+    with db.SessionLocal() as session:
+        session.add(
+            models.Submission(
+                console_id="console-bad-kind",
+                coev2_job_id="job-bad",
+                kind="unknown-kind",
+                submitted_at=datetime(2026, 1, 4, tzinfo=timezone.utc),
+                last_seen_status="running",
+                last_seen_score=None,
+                idempotency_key="idem-bad",
+            )
+        )
+        session.commit()
+
+    client = TestClient(app)
+    bff_response = client.get("/bff/submissions/console-bad-kind").json()
+    page = client.get("/submissions/console-bad-kind")
+
+    assert "error" in bff_response
+    assert "Unsupported job kind" in bff_response["error"]
+    assert bff_response["correlation_id"]
+    assert "Backend error" in page.text
+    assert "Unsupported job kind" in page.text
+    assert re.search(r"Correlation ID: [0-9a-f-]{36}", page.text)
 
 
 def test_failure_empty_loading_and_malformed_states_render_safely(monkeypatch, tmp_path):

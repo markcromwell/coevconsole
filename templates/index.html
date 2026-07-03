@@ -46,6 +46,7 @@
   {% elif state == "result" %}
     <section class="panel">
       <h2>Result</h2>
+      <p>Status: {{ result_view.status if result_view.status is not none else "unknown" }}</p>
       <p>Score: {{ result_view.score if result_view.score is not none else "unknown" }}</p>
       <p>Cost: {{ result_view.cost }}</p>
       {% if result_view.findings is not none %}

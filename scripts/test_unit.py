@@ -1,12 +1,270 @@
-# Unit tests for CoEv2 Console. Uses the app factory for an isolated instance.
+import importlib
+import re
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pytest
 from fastapi.testclient import TestClient
-
-from app import create_app
-
-client = TestClient(create_app())
+from sqlalchemy import inspect
 
 
-def test_health_ok():
-    resp = client.get("/health")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+def _load_app(monkeypatch, tmp_path, api_key=None):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
+    if api_key is None:
+        monkeypatch.delenv("COUNCIL_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("COUNCIL_API_KEY", api_key)
+
+    import app.config as config
+    import app.db as db
+    import app.models as models
+    import app.coev2_client as coev2_client
+    import app.routers.bff as bff
+    import app.routers.web as web
+    import app as app_module
+
+    config = importlib.reload(config)
+    db = importlib.reload(db)
+    models = importlib.reload(models)
+    coev2_client = importlib.reload(coev2_client)
+    bff = importlib.reload(bff)
+    importlib.reload(web)
+    app_module = importlib.reload(app_module)
+    return app_module.create_app(), db, models, coev2_client, bff, config
+
+
+class FakeCoEv2Client:
+    def __init__(self, grade_result=None, job_result=None, error=None):
+        self.grade_result = grade_result or {
+            "job_id": "job-1",
+            "status": "complete",
+            "score": 0.91,
+            "findings": ["actual finding"],
+            "cost": "0.00",
+        }
+        self.job_result = job_result or {
+            "job_id": "job-1",
+            "status": "complete",
+            "score": 0.97,
+            "findings": ["live finding"],
+        }
+        self.error = error
+        self.grade_calls = []
+        self.poll_calls = []
+
+    def grade(self, payload):
+        self.grade_calls.append(payload)
+        if self.error:
+            raise self.error
+        result = self.grade_result(payload) if callable(self.grade_result) else self.grade_result
+        return result, "corr-grade"
+
+    def get_job(self, job_id):
+        self.poll_calls.append(job_id)
+        if self.error:
+            raise self.error
+        result = self.job_result(job_id) if callable(self.job_result) else self.job_result
+        return result, "corr-live"
+
+
+def _override_client(app, coev2_client_module, fake):
+    app.dependency_overrides[coev2_client_module.get_coev2_client] = lambda: fake
+
+
+def _hidden(html, name):
+    match = re.search(rf'name="{name}" value="([^"]+)"', html)
+    assert match, html
+    return match.group(1)
+
+
+def test_health_root_model_and_config_ok(monkeypatch, tmp_path):
+    app, db, models, _, _, config = _load_app(monkeypatch, tmp_path, api_key="server-secret")
+    client = TestClient(app)
+
+    assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/").status_code == 200
+    assert config.settings.council_api_key == "server-secret"
+    assert config.settings.coev2_api_base_url
+    assert "submissions" in inspect(db.engine).get_table_names()
+    assert list(models.Submission.__table__.columns.keys()) == [
+        "console_id",
+        "coev2_job_id",
+        "kind",
+        "submitted_at",
+        "last_seen_status",
+        "last_seen_score",
+        "idempotency_key",
+    ]
+
+
+def test_key_attached_upstream_but_redacted_from_logs_and_responses(monkeypatch, tmp_path, caplog):
+    app, _, _, coev2_client, _, config = _load_app(monkeypatch, tmp_path, api_key="super-secret")
+    seen = {}
+
+    class FakeHTTPXClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def request(self, method, url, headers=None, **kwargs):
+            seen["headers"] = headers
+            return httpx.Response(
+                200,
+                json={
+                    "job_id": "job-redacted",
+                    "score": 1,
+                    "findings": ["super-secret must not leak"],
+                },
+            )
+
+    monkeypatch.setattr(coev2_client.httpx, "Client", FakeHTTPXClient)
+    caplog.set_level("INFO")
+    client = TestClient(app)
+
+    draft = client.post("/bff/grade/prepare", json={"payload": {"prompt": "x"}}).json()
+    response = client.post("/bff/grade/confirm", json=draft)
+
+    assert seen["headers"]["Authorization"] == "Bearer super-secret"
+    assert "super-secret" not in response.text
+    assert "super-secret" not in client.get("/").text
+    assert "super-secret" not in client.get("/health").text
+    assert "super-secret" not in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert config.settings.council_api_key == "super-secret"
+
+
+def test_confirm_is_idempotent_and_resubmit_is_fresh(monkeypatch, tmp_path):
+    app, db, _, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+    fake = FakeCoEv2Client(grade_result={"job_id": "job-one", "status": "queued", "score": 0.4})
+    _override_client(app, coev2_client, fake)
+    client = TestClient(app)
+
+    draft = client.post("/bff/grade/prepare", json={"payload": {"prompt": "one"}}).json()
+    assert fake.grade_calls == []
+
+    first = client.post("/bff/grade/confirm", json=draft).json()
+    second = client.post("/bff/grade/confirm", json=draft).json()
+    assert first["coev2_job_id"] == "job-one"
+    assert second["duplicate"] is True
+    assert second["coev2_job_id"] == "job-one"
+    assert fake.grade_calls == [{"prompt": "one"}]
+
+    with db.SessionLocal() as session:
+        rows = session.execute(db.Base.metadata.tables["submissions"].select()).all()
+    assert len(rows) == 1
+    assert rows[0]._mapping["kind"] == "grade"
+    assert rows[0]._mapping["coev2_job_id"] == "job-one"
+    assert rows[0]._mapping["submitted_at"] is not None
+
+    resubmit = client.post("/bff/grade/prepare", json={"payload": {"prompt": "one"}}).json()
+    assert resubmit["idempotency_key"] != draft["idempotency_key"]
+    assert resubmit["confirm_token"] != draft["confirm_token"]
+
+
+def test_submit_and_render_uses_actual_json_and_cost_honesty(monkeypatch, tmp_path):
+    app, _, _, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+
+    def grade_result(payload):
+        return {
+            "job_id": "job-dynamic",
+            "status": "complete",
+            "nested": {
+                "score": 0.33 if payload["prompt"] == "low" else 0.88,
+                "findings": [f"finding for {payload['prompt']}"],
+                "cost": "$0.01",
+            },
+        }
+
+    fake = FakeCoEv2Client(grade_result=grade_result)
+    _override_client(app, coev2_client, fake)
+    client = TestClient(app)
+
+    prepare = client.post("/grade/prepare", data={"prompt": "high"})
+    assert "Confirm spend" in prepare.text
+    assert "Backend reported cost: unknown" in prepare.text
+    assert "may spend backend resources" in prepare.text
+
+    confirm = client.post(
+        "/grade/confirm",
+        data={
+            "confirm_token": _hidden(prepare.text, "confirm_token"),
+            "idempotency_key": _hidden(prepare.text, "idempotency_key"),
+        },
+    )
+    assert "Score: 0.88" in confirm.text
+    assert "finding for high" in confirm.text
+    assert "Cost: $0.01" in confirm.text
+    assert "0.33" not in confirm.text
+
+
+def test_history_lists_last_20_and_submission_page_polls_live(monkeypatch, tmp_path):
+    app, db, models, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+    fake = FakeCoEv2Client(
+        job_result={"job_id": "job-24", "status": "complete", "score": 99, "findings": ["fresh"]}
+    )
+    _override_client(app, coev2_client, fake)
+    base_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with db.SessionLocal() as session:
+        for index in range(25):
+            session.add(
+                models.Submission(
+                    console_id=f"console-{index}",
+                    coev2_job_id=f"job-{index}",
+                    kind="grade",
+                    submitted_at=base_time + timedelta(minutes=index),
+                    last_seen_status="stale",
+                    last_seen_score=1,
+                    idempotency_key=f"idem-{index}",
+                )
+            )
+        session.commit()
+
+    client = TestClient(app)
+    history = client.get("/bff/submissions").json()
+    assert len(history) == 20
+    assert history[0]["console_id"] == "console-24"
+    assert history[-1]["console_id"] == "console-5"
+
+    page = client.get("/submissions/console-24")
+    assert "Score: 99" in page.text
+    assert "fresh" in page.text
+    assert fake.poll_calls == ["job-24"]
+
+
+def test_failure_empty_loading_and_malformed_states_render_safely(monkeypatch, tmp_path):
+    app, _, _, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+    client = TestClient(app)
+    assert "No submissions yet." in client.get("/").text
+    assert "Loading" in client.get("/loading").text
+
+    malformed = FakeCoEv2Client(grade_result=["not", "an", "object"])
+    _override_client(app, coev2_client, malformed)
+    draft = client.post("/grade/prepare", data={"prompt": "bad"})
+    response = client.post(
+        "/grade/confirm",
+        data={
+            "confirm_token": _hidden(draft.text, "confirm_token"),
+            "idempotency_key": _hidden(draft.text, "idempotency_key"),
+        },
+    )
+    assert "Malformed response received" in response.text
+
+    from app.coev2_client import CoEv2ClientError
+
+    failing = FakeCoEv2Client(error=CoEv2ClientError("CoEv2 backend error", "corr-500", 502))
+    _override_client(app, coev2_client, failing)
+    draft = client.post("/grade/prepare", data={"prompt": "fail"})
+    response = client.post(
+        "/grade/confirm",
+        data={
+            "confirm_token": _hidden(draft.text, "confirm_token"),
+            "idempotency_key": _hidden(draft.text, "idempotency_key"),
+        },
+    )
+    assert "Backend error" in response.text
+    assert "corr-500" in response.text

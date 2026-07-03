@@ -14,18 +14,6 @@ def create_app() -> FastAPI:
     application = FastAPI(title=settings.app_name, version=settings.version)
     application.include_router(health_router)
 
-    @application.get("/")
-    def _root() -> dict:
-        # Default landing so the program root is never a bare 404. A scaffolded app defines only its
-        # real routes (+ /health), so GET / returned a naked FastAPI 404 that a human/evaluator hitting
-        # the root reads as "the app is down" (Dogfood Run 1 finding #4). Point them at the real API.
-        return {
-            "service": settings.app_name,
-            "version": settings.version,
-            "docs": "/docs",
-            "health": "/health",
-        }
-
     import app.routers as routers_pkg
     for mod in pkgutil.iter_modules(routers_pkg.__path__):
         module = importlib.import_module(f"app.routers.{mod.name}")

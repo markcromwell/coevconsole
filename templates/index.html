@@ -1,8 +1,88 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>CoEv2 Console</title></head>
+<head>
+  <meta charset="utf-8">
+  <title>CoEv2 Console</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 980px; }
+    textarea { width: 100%; min-height: 7rem; }
+    button { padding: 0.45rem 0.75rem; }
+    .panel { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+    .error { border-color: #b00020; background: #fff5f7; }
+    .muted { color: #555; }
+    pre { background: #f5f5f5; overflow: auto; padding: 1rem; }
+    table { width: 100%; border-collapse: collapse; }
+    td, th { border-bottom: 1px solid #ddd; padding: 0.5rem; text-align: left; }
+  </style>
+</head>
 <body>
-  <h1>CoEv2 Console</h1>
-  <p>Standard SOV Program &mdash; +ui module. This page is server-rendered with Jinja2.</p>
+  <h1>{{ app_name }}</h1>
+  <form method="post" action="/grade/prepare">
+    <label for="prompt">Grade input</label>
+    <textarea id="prompt" name="prompt">{{ prompt or "" }}</textarea>
+    <button type="submit">Prepare grade</button>
+  </form>
+
+  {% if state == "confirm" %}
+    <section class="panel">
+      <h2>Confirm spend</h2>
+      <p>{{ draft.spend_warning }}</p>
+      <p>Backend reported cost: {{ draft.cost }}</p>
+      <form method="post" action="/grade/confirm">
+        <input type="hidden" name="confirm_token" value="{{ draft.confirm_token }}">
+        <input type="hidden" name="idempotency_key" value="{{ draft.idempotency_key }}">
+        <button type="submit">Confirm and submit</button>
+      </form>
+    </section>
+  {% elif state == "result" %}
+    <section class="panel">
+      <h2>Result</h2>
+      <p>Score: {{ result_view.score if result_view.score is not none else "unknown" }}</p>
+      <p>Cost: {{ result_view.cost }}</p>
+      {% if result_view.findings is not none %}
+        <h3>Findings</h3>
+        <pre>{{ result_view.findings | tojson(indent=2) }}</pre>
+      {% endif %}
+      {% if result_view.malformed %}
+        <p>Malformed response received; raw response is shown below.</p>
+      {% endif %}
+      <pre>{{ result | tojson(indent=2) }}</pre>
+    </section>
+  {% elif state == "error" %}
+    <section class="panel error">
+      <h2>Backend error</h2>
+      <p>{{ response.error }}</p>
+      <p>Correlation ID: {{ response.correlation_id }}</p>
+    </section>
+  {% elif state == "loading" %}
+    <section class="panel">
+      <h2>Loading</h2>
+      <p>Waiting for the latest CoEv2 status.</p>
+    </section>
+  {% endif %}
+
+  <section>
+    <h2>History</h2>
+    {% if history %}
+      <table>
+        <thead><tr><th>Submitted</th><th>Kind</th><th>Job</th><th>Last seen</th></tr></thead>
+        <tbody>
+          {% for item in history %}
+            <tr>
+              <td><a href="/submissions/{{ item.console_id }}">{{ item.submitted_at }}</a></td>
+              <td>{{ item.kind }}</td>
+              <td>{{ item.coev2_job_id }}</td>
+              <td>
+                {{ item.last_seen_status or "unknown" }} /
+                {{ item.last_seen_score if item.last_seen_score is not none else "unknown" }}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No submissions yet.</p>
+    {% endif %}
+  </section>
 </body>
 </html>

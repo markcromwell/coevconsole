@@ -15,6 +15,7 @@ from app.models import Submission
 
 router = APIRouter(prefix="/bff", tags=["bff"])
 _DRAFTS: dict[str, dict[str, Any]] = {}
+_VALID_LEVELS = frozenset({"vision", "epic", "story", "spec"})
 
 
 class GradeDraftIn(BaseModel):
@@ -39,6 +40,24 @@ def prepare_grade(payload: dict[str, Any]) -> dict[str, Any]:
         "idempotency_key": idempotency_key,
         "spend_warning": "Submitting will call CoEv2 and may spend backend resources.",
         "cost": "unknown",
+    }
+
+
+def _build_grade_request(payload: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        program_id = int(payload["program_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if program_id <= 0:
+        return None
+    level = payload.get("level")
+    if level not in _VALID_LEVELS:
+        return None
+    content = payload.get("content") or payload.get("input") or ""
+    return {
+        "program_id": program_id,
+        "level": level,
+        "artifact": {"content": str(content)},
     }
 
 
@@ -97,8 +116,15 @@ def confirm_grade(
             "correlation_id": str(uuid4()),
         }
 
+    grade_request = _build_grade_request(draft["payload"])
+    if grade_request is None:
+        return {
+            "error": "Invalid grade request",
+            "correlation_id": str(uuid4()),
+        }
+
     try:
-        data, correlation_id = client.grade(draft["payload"])
+        data, correlation_id = client.grade(grade_request)
     except CoEv2ClientError as exc:
         return {
             "error": exc.message,

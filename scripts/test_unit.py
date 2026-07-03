@@ -77,6 +77,14 @@ def _hidden(html, name):
     return match.group(1)
 
 
+GRADE_FORM = {"program_id": 42, "level": "story", "content": "operator input"}
+GRADE_REQUEST = {
+    "program_id": 42,
+    "level": "story",
+    "artifact": {"content": "operator input"},
+}
+
+
 def test_health_root_model_and_config_ok(monkeypatch, tmp_path):
     app, db, models, _, _, config = _load_app(monkeypatch, tmp_path, api_key="server-secret")
     client = TestClient(app)
@@ -126,7 +134,7 @@ def test_key_attached_upstream_but_redacted_from_logs_and_responses(monkeypatch,
     caplog.set_level("INFO")
     client = TestClient(app)
 
-    draft = client.post("/bff/grade/prepare", json={"payload": {"prompt": "x"}}).json()
+    draft = client.post("/bff/grade/prepare", json={"payload": GRADE_FORM}).json()
     response = client.post("/bff/grade/confirm", json=draft)
 
     assert seen["headers"]["Authorization"] == "Bearer super-secret"
@@ -138,13 +146,33 @@ def test_key_attached_upstream_but_redacted_from_logs_and_responses(monkeypatch,
     assert config.settings.council_api_key == "super-secret"
 
 
+def test_confirm_grade_sends_valid_grade_request_and_renders_score(monkeypatch, tmp_path):
+    app, db, _, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
+    fake = FakeCoEv2Client(grade_result={"job_id": "job-grade", "status": "complete", "score": 0.72})
+    _override_client(app, coev2_client, fake)
+    client = TestClient(app)
+
+    draft = client.post("/bff/grade/prepare", json={"payload": GRADE_FORM}).json()
+    response = client.post("/bff/grade/confirm", json=draft).json()
+
+    assert fake.grade_calls == [GRADE_REQUEST]
+    assert "prompt" not in fake.grade_calls[0]
+    assert response["result"]["score"] == 0.72
+
+    with db.SessionLocal() as session:
+        rows = session.execute(db.Base.metadata.tables["submissions"].select()).all()
+    assert len(rows) == 1
+    assert rows[0]._mapping["last_seen_score"] == 0.72
+
+
 def test_confirm_is_idempotent_and_resubmit_is_fresh(monkeypatch, tmp_path):
     app, db, _, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
     fake = FakeCoEv2Client(grade_result={"job_id": "job-one", "status": "queued", "score": 0.4})
     _override_client(app, coev2_client, fake)
     client = TestClient(app)
 
-    draft = client.post("/bff/grade/prepare", json={"payload": {"prompt": "one"}}).json()
+    payload = {"program_id": 7, "level": "epic", "content": "one"}
+    draft = client.post("/bff/grade/prepare", json={"payload": payload}).json()
     assert fake.grade_calls == []
 
     first = client.post("/bff/grade/confirm", json=draft).json()
@@ -152,7 +180,10 @@ def test_confirm_is_idempotent_and_resubmit_is_fresh(monkeypatch, tmp_path):
     assert first["coev2_job_id"] == "job-one"
     assert second["duplicate"] is True
     assert second["coev2_job_id"] == "job-one"
-    assert fake.grade_calls == [{"prompt": "one"}]
+    assert fake.grade_calls == [
+        {"program_id": 7, "level": "epic", "artifact": {"content": "one"}}
+    ]
+    assert "prompt" not in fake.grade_calls[0]
 
     with db.SessionLocal() as session:
         rows = session.execute(db.Base.metadata.tables["submissions"].select()).all()
@@ -161,7 +192,7 @@ def test_confirm_is_idempotent_and_resubmit_is_fresh(monkeypatch, tmp_path):
     assert rows[0]._mapping["coev2_job_id"] == "job-one"
     assert rows[0]._mapping["submitted_at"] is not None
 
-    resubmit = client.post("/bff/grade/prepare", json={"payload": {"prompt": "one"}}).json()
+    resubmit = client.post("/bff/grade/prepare", json={"payload": payload}).json()
     assert resubmit["idempotency_key"] != draft["idempotency_key"]
     assert resubmit["confirm_token"] != draft["confirm_token"]
 
@@ -170,12 +201,13 @@ def test_submit_and_render_uses_actual_json_and_cost_honesty(monkeypatch, tmp_pa
     app, _, _, coev2_client, _, _ = _load_app(monkeypatch, tmp_path)
 
     def grade_result(payload):
+        content = payload["artifact"]["content"]
         return {
             "job_id": "job-dynamic",
             "status": "complete",
             "nested": {
-                "score": 0.33 if payload["prompt"] == "low" else 0.88,
-                "findings": [f"finding for {payload['prompt']}"],
+                "score": 0.33 if content == "low" else 0.88,
+                "findings": [f"finding for {content}"],
                 "cost": "$0.01",
             },
         }
@@ -184,7 +216,10 @@ def test_submit_and_render_uses_actual_json_and_cost_honesty(monkeypatch, tmp_pa
     _override_client(app, coev2_client, fake)
     client = TestClient(app)
 
-    prepare = client.post("/grade/prepare", data={"prompt": "high"})
+    prepare = client.post(
+        "/grade/prepare",
+        data={"program_id": 99, "level": "spec", "content": "high"},
+    )
     assert "Confirm spend" in prepare.text
     assert "Backend reported cost: unknown" in prepare.text
     assert "may spend backend resources" in prepare.text
@@ -244,7 +279,10 @@ def test_failure_empty_loading_and_malformed_states_render_safely(monkeypatch, t
 
     malformed = FakeCoEv2Client(grade_result=["not", "an", "object"])
     _override_client(app, coev2_client, malformed)
-    draft = client.post("/grade/prepare", data={"prompt": "bad"})
+    draft = client.post(
+        "/grade/prepare",
+        data={"program_id": 1, "level": "vision", "content": "bad"},
+    )
     response = client.post(
         "/grade/confirm",
         data={
@@ -258,7 +296,10 @@ def test_failure_empty_loading_and_malformed_states_render_safely(monkeypatch, t
 
     failing = FakeCoEv2Client(error=CoEv2ClientError("CoEv2 backend error", "corr-500", 502))
     _override_client(app, coev2_client, failing)
-    draft = client.post("/grade/prepare", data={"prompt": "fail"})
+    draft = client.post(
+        "/grade/prepare",
+        data={"program_id": 1, "level": "vision", "content": "fail"},
+    )
     response = client.post(
         "/grade/confirm",
         data={

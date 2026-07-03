@@ -42,11 +42,22 @@ def _find_first(data: Any, names: set[str]) -> Any:
 
 def _view_model(result: Any) -> dict[str, Any]:
     if not result:
-        return {"score": None, "findings": None, "cost": "unknown", "malformed": True}
+        return {
+            "status": None,
+            "score": None,
+            "findings": None,
+            "cost": "unknown",
+            "malformed": True,
+        }
+    cost = _find_first(
+        result,
+        {"actual_cost_usd", "cost", "total_cost", "reported_cost"},
+    )
     return {
+        "status": _find_first(result, {"status"}),
         "score": _find_first(result, {"score", "grade_score"}),
         "findings": _find_first(result, {"findings", "issues", "comments"}),
-        "cost": _find_first(result, {"cost", "total_cost", "reported_cost"}) or "unknown",
+        "cost": cost if cost is not None else "unknown",
         "malformed": not isinstance(result, dict),
     }
 
@@ -140,7 +151,7 @@ def submission_page(
     if submission is None:
         return RedirectResponse("/", status_code=303)
     try:
-        result, correlation_id = client.get_job(submission.coev2_job_id)
+        result, correlation_id = client.get_job(submission.coev2_job_id, submission.kind)
         response = {
             "console_id": submission.console_id,
             "coev2_job_id": submission.coev2_job_id,

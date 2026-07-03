@@ -94,6 +94,32 @@ def _extract_status(data: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _extract_actual_cost_usd(data: Any) -> float | None:
+    if isinstance(data, dict):
+        value = data.get("actual_cost_usd")
+        if isinstance(value, int | float):
+            return float(value)
+        for item in data.values():
+            cost = _extract_actual_cost_usd(item)
+            if cost is not None:
+                return cost
+    if isinstance(data, list):
+        for item in data:
+            cost = _extract_actual_cost_usd(item)
+            if cost is not None:
+                return cost
+    return None
+
+
+def _build_live_payload(data: Any) -> dict[str, Any]:
+    return {
+        "status": _extract_status(data),
+        "score": _extract_score(data),
+        "actual_cost_usd": _extract_actual_cost_usd(data),
+        "payload": data,
+    }
+
+
 def confirm_grade(
     confirm_token: str,
     idempotency_key: str,
@@ -197,13 +223,13 @@ def get_submission(
     if submission is None:
         return {"error": "Submission not found", "correlation_id": str(uuid4())}
     try:
-        data, correlation_id = client.get_job(submission.coev2_job_id)
+        data, correlation_id = client.get_job(submission.coev2_job_id, submission.kind)
         return {
             "console_id": submission.console_id,
             "coev2_job_id": submission.coev2_job_id,
             "kind": submission.kind,
             "correlation_id": correlation_id,
-            "live": data,
+            "live": _build_live_payload(data),
         }
     except CoEv2ClientError as exc:
         return {"error": exc.message, "correlation_id": exc.correlation_id}
